@@ -1,0 +1,96 @@
+name: xauusd-bot
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '2,17,32,47 7-20 * * 1-5'   # tick: weekdays, London+NY
+    - cron: '5 */4 * * *'                # health: tiap 4 jam
+    - cron: '30 0 * * *'                 # retrain: 00:30 UTC
+    - cron: '0 1 * * 0'                  # report: Minggu 01:00 UTC
+  workflow_dispatch:
+    inputs:
+      task:
+        type: choice
+        options: [tick, retrain, health, report]
+        default: tick
+
+concurrency:
+  group: xauusd
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      ACCOUNT_EQUITY: '1000'
+
+    steps:
+      - name: Determine task
+        id: task
+        run: |
+          if [ -n "${{ inputs.task }}" ]; then
+            TASK="${{ inputs.task }}"
+          else
+            case "${{ github.event.schedule }}" in
+              "5 */4 * * *") TASK=health ;;
+              "30 0 * * *")  TASK=retrain ;;
+              "0 1 * * 0")   TASK=report ;;
+              *)             TASK=tick ;;
+            esac
+          fi
+          echo "task=$TASK" >> $GITHUB_OUTPUT
+          echo "Task: $TASK"
+
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 1 }
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install
+        run: pip install -r requirements.txt
+
+      - name: Check token
+        run: |
+          if [ -z "$TELEGRAM_TOKEN" ]; then
+            echo "::error::Set TELEGRAM_TOKEN secret first"
+            exit 1
+          fi
+
+      - name: Run
+        run: |
+          set +e
+          python bot.py --task ${{ steps.task.outputs.task }} 2>&1 | tee /tmp/bot.log
+          RC=${PIPESTATUS[0]}
+          if [ $RC -ne 0 ]; then
+            curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+              -d chat_id="$(python -c "import sqlite3;print(sqlite3.connect('state/state.db').execute(\"select v from meta where k='tg_chat_id'\").fetchone()[0] if __import__('os').path.exists('state/state.db') else '')" 2>/dev/null)" \
+              --data-urlencode "text=⚠️ ${{ steps.task.outputs.task }} rc=$RC" >/dev/null
+          fi
+          exit $RC
+
+      - name: Commit state
+        if: always()
+        run: |
+          rm -f state/*.db-wal state/*.db-shm 2>/dev/null || true
+          git config user.name  "xauusd-bot"
+          git config user.email "bot@noreply.local"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "no changes"; exit 0
+          fi
+          git commit -m "chore: ${{ steps.task.outputs.task }} $(date -u +%Y%m%dT%H%M%SZ) [skip ci]"
+          for i in 1 2 3 4 5; do
+            git pull --rebase --autostash origin main && git push origin main && exit 0
+            git rebase --abort 2>/dev/null || true
+            sleep 3
+          done
+          echo "::error::push failed"; exit 1
